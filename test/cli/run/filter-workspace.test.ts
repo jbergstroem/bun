@@ -451,7 +451,7 @@ describe("bun", () => {
     });
   });
 
-  test("ignore dependency order on cycle, preserving pre and post script order", () => {
+  test("ignore dependency order within a cycle, preserving pre and post script order", () => {
     using dir = tempDir("testworkspace", {
       dep0: {
         "write.js": "await Bun.write('out.txt', 'success')",
@@ -535,6 +535,115 @@ describe("bun", () => {
       antipattern: [/not found/],
       command: ["script"],
     });
+  });
+
+  // A dev-dependency cycle (a <-> c) must not disable ordering for packages
+  // outside the cycle: b has a production dependency on a, so it must only run
+  // after a has written its marker. Every cycle member still runs, and the
+  // cycle is reported in a warning naming its packages. Fresh temp dir per run:
+  // the marker file would otherwise leak a pass from an earlier run.
+  test("a dev-dependency cycle does not disable ordering for dependents of the cycle", async () => {
+    using dir = tempDir("filter-cycle-prod-edge", {
+      a: {
+        "index.js": [
+          "await new Promise(resolve => setTimeout(resolve, 500))",
+          "await Bun.write('dist/marker', 'built')",
+        ].join(";"),
+        "package.json": JSON.stringify({
+          name: "a",
+          devDependencies: { c: "workspace:*" },
+          scripts: { script: `${bunExe()} run index.js` },
+        }),
+      },
+      b: {
+        // Throws (and exits nonzero) if a's marker does not exist yet.
+        "index.js": "console.log('order: ' + (await Bun.file('../a/dist/marker').text()))",
+        "package.json": JSON.stringify({
+          name: "b",
+          dependencies: { a: "workspace:*" },
+          scripts: { script: `${bunExe()} run index.js` },
+        }),
+      },
+      c: {
+        "package.json": JSON.stringify({
+          name: "c",
+          devDependencies: { a: "workspace:*" },
+          scripts: { script: "echo c-ran" },
+        }),
+      },
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "run", "--filter", "*", "script"],
+      cwd: String(dir),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // b ran after a finished.
+    expect(stdout).toContain("order: built");
+    // The cycle members still ran to completion.
+    expect(stdout).toContain("c-ran");
+    // The warning names the packages in the cycle, and only those.
+    expect(stderr).toContain("Dependency cycle detected:");
+    expect(stderr).toContain('"a"');
+    expect(stderr).toContain('"c"');
+    expect(stderr).not.toContain('"b"');
+    expect(exitCode).toBe(0);
+  });
+
+  test("a cycle does not disable ordering between unrelated packages", async () => {
+    using dir = tempDir("filter-cycle-unrelated", {
+      a: {
+        "package.json": JSON.stringify({
+          name: "a",
+          devDependencies: { c: "workspace:*" },
+          scripts: { script: "echo a-ran" },
+        }),
+      },
+      c: {
+        "package.json": JSON.stringify({
+          name: "c",
+          devDependencies: { a: "workspace:*" },
+          scripts: { script: "echo c-ran" },
+        }),
+      },
+      d: {
+        "index.js": "console.log('unrelated-order: ' + (await Bun.file('../e/out.txt').text()))",
+        "package.json": JSON.stringify({
+          name: "d",
+          dependencies: { e: "workspace:*" },
+          scripts: { script: `${bunExe()} run index.js` },
+        }),
+      },
+      e: {
+        "index.js": [
+          "await new Promise(resolve => setTimeout(resolve, 500))",
+          "await Bun.write('out.txt', 'success')",
+        ].join(";"),
+        "package.json": JSON.stringify({
+          name: "e",
+          scripts: { script: `${bunExe()} run index.js` },
+        }),
+      },
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "run", "--filter", "*", "script"],
+      cwd: String(dir),
+      env: bunEnv,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    // d ran only after e wrote its file, even though a <-> c form a cycle.
+    expect(stdout).toContain("unrelated-order: success");
+    expect(stdout).toContain("a-ran");
+    expect(stdout).toContain("c-ran");
+    // The warning only names the cycle's packages.
+    expect(stderr).toContain("Dependency cycle detected:");
+    expect(stderr).not.toContain('"d"');
+    expect(stderr).not.toContain('"e"');
+    expect(exitCode).toBe(0);
   });
 
   test("should error with missing script", () => {

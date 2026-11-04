@@ -71,19 +71,11 @@ pub(crate) struct ProcessHandle<'a> {
 
     remaining_dependencies: usize,
     dependents: Vec<*mut ProcessHandle<'a>>,
-    visit_state: VisitState,
     /// True if the previous handle is the script that runs right before this one in the same
     /// package's `pre`/main/`post` chain.
     follows_previous: bool,
     /// True if the previous script in the chain failed or was skipped, so this one never runs.
     skipped: bool,
-}
-
-#[derive(Clone, Copy)]
-enum VisitState {
-    Unvisited,
-    Visiting,
-    Visited,
 }
 
 impl<'a> ProcessHandle<'a> {
@@ -1046,7 +1038,6 @@ pub(crate) fn run_scripts_with_filter(
             },
             remaining_dependencies: 0,
             dependents: Vec::new(),
-            visit_state: VisitState::Unvisited,
             follows_previous: false,
             skipped: false,
         });
@@ -1080,20 +1071,66 @@ pub(crate) fn run_scripts_with_filter(
         }
     }
 
-    // check if there is a dependency cycle
-    let mut has_cycle_flag = false;
-    for handle in state.handles.iter_mut() {
-        if has_cycle(handle) {
-            has_cycle_flag = true;
-            break;
-        }
+    // Dependency cycles: the packages in a cycle have no topological order, but
+    // everything else does. Find the strongly connected components and drop
+    // only the edges *inside* a cyclic component: its scripts run concurrently,
+    // while every other edge (including edges into and out of the cycle) keeps
+    // ordering execution along the condensation DAG.
+    let (scc_id, scc_count) = compute_sccs(&state.handles);
+    let mut cyclic_sccs = vec![false; scc_count];
+    let mut dropped_dependents: Vec<usize> = Vec::new();
+    for v in 0..state.handles.len() {
+        let base: *const ProcessHandle = state.handles.as_ptr();
+        // Detach the Vec so no borrow of `state.handles` is held while it is
+        // filtered (the raw pointers it holds point back into the slice).
+        let mut dependents = core::mem::take(&mut state.handles[v].dependents);
+        dependents.retain(|&dep| {
+            // SAFETY: `dep` points into `state.handles` (the same allocation as
+            // `base`); only the index is derived, nothing is dereferenced.
+            let w = unsafe { dep.cast_const().offset_from(base) } as usize;
+            if scc_id[w] == scc_id[v] {
+                // An intra-component edge only exists in a cyclic component
+                // (a self-edge included: `w == v` is the same component).
+                cyclic_sccs[scc_id[v]] = true;
+                dropped_dependents.push(w);
+                return false;
+            }
+            true
+        });
+        state.handles[v].dependents = dependents;
     }
-    // if there is, we ignore dependency order completely
-    if has_cycle_flag {
-        for handle in state.handles.iter_mut() {
-            handle.dependents.clear();
-            handle.remaining_dependencies = 0;
+    // Keep the wait counters consistent with the edges that remain.
+    for w in dropped_dependents {
+        state.handles[w].remaining_dependencies -= 1;
+    }
+    let mut cycle_names: Vec<u8> = Vec::new();
+    for scc in 0..scc_count {
+        if !cyclic_sccs[scc] {
+            continue;
         }
+        cycle_names.clear();
+        // Several scripts of one package share a package name; list it once.
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for (v, handle) in state.handles.iter().enumerate() {
+            let name: &[u8] = &handle.config.package_name;
+            if scc_id[v] == scc && !seen.contains(&name) {
+                seen.push(name);
+            }
+        }
+        for (i, name) in seen.iter().enumerate() {
+            if i > 0 {
+                cycle_names.extend_from_slice(b", ");
+            }
+            let _ = write!(
+                &mut cycle_names,
+                "\"{}\"",
+                bun_core::fmt::escape_control_chars(name)
+            );
+        }
+        bun_core::warn!(
+            "Dependency cycle detected: {}. Scripts in these packages will run without waiting for each other.",
+            bstr::BStr::new(&cycle_names)
+        );
     }
 
     // set up dependencies between pre/post scripts
@@ -1148,21 +1185,77 @@ pub(crate) fn run_scripts_with_filter(
     Global::exit(status as u32);
 }
 
-fn has_cycle(current: &mut ProcessHandle) -> bool {
-    current.visit_state = VisitState::Visiting;
-    for &dep in &current.dependents {
-        // SAFETY: dep points into state.handles, valid for the run loop lifetime.
-        let dep = unsafe { &mut *dep };
-        match dep.visit_state {
-            VisitState::Visiting => return true,
-            VisitState::Unvisited => {
-                if has_cycle(dep) {
-                    return true;
+/// Strongly connected components of the `dependents` graph (Tarjan's
+/// algorithm). Iterative with an explicit frame stack: the DFS depth is
+/// bounded only by the number of scripts, and a long dependency chain must not
+/// overflow the native stack. Returns one component id per handle and the
+/// number of components; two handles are in a cycle together iff they share an
+/// id.
+fn compute_sccs(handles: &[ProcessHandle]) -> (Vec<usize>, usize) {
+    const UNSET: usize = usize::MAX;
+    let base: *const ProcessHandle = handles.as_ptr();
+    let n = handles.len();
+    let mut index = vec![UNSET; n];
+    let mut lowlink = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut scc_id = vec![UNSET; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next_index: usize = 0;
+    let mut scc_count: usize = 0;
+    // DFS frames of (node, next outgoing edge to look at).
+    let mut frames: Vec<(usize, usize)> = Vec::new();
+
+    for start in 0..n {
+        if index[start] != UNSET {
+            continue;
+        }
+        frames.push((start, 0));
+        while let Some(&(v, first_edge)) = frames.last() {
+            if first_edge == 0 {
+                index[v] = next_index;
+                lowlink[v] = next_index;
+                next_index += 1;
+                stack.push(v);
+                on_stack[v] = true;
+            }
+            let mut edge = first_edge;
+            let mut descended = false;
+            while edge < handles[v].dependents.len() {
+                let dep = handles[v].dependents[edge];
+                // SAFETY: `dep` points into `handles` (the same allocation as
+                // `base`); only the index is derived, nothing is dereferenced.
+                let w = unsafe { dep.cast_const().offset_from(base) } as usize;
+                edge += 1;
+                if index[w] == UNSET {
+                    if let Some(frame) = frames.last_mut() {
+                        frame.1 = edge;
+                    }
+                    frames.push((w, 0));
+                    descended = true;
+                    break;
+                }
+                if on_stack[w] {
+                    lowlink[v] = lowlink[v].min(index[w]);
                 }
             }
-            VisitState::Visited => {}
+            if descended {
+                continue;
+            }
+            frames.pop();
+            if let Some(&(parent, _)) = frames.last() {
+                lowlink[parent] = lowlink[parent].min(lowlink[v]);
+            }
+            if lowlink[v] == index[v] {
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    scc_id[w] = scc_count;
+                    if w == v {
+                        break;
+                    }
+                }
+                scc_count += 1;
+            }
         }
     }
-    current.visit_state = VisitState::Visited;
-    false
+    (scc_id, scc_count)
 }
